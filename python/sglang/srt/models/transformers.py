@@ -33,6 +33,11 @@ from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from sglang.srt.configs.embedding_model_spec import (
+    has_model_defined_embedding_architecture,
+    resolve_embedding_normalize,
+    resolve_transformers_pooling,
+)
 from sglang.srt.distributed import (
     divide,
     get_pp_indices,
@@ -52,7 +57,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -918,7 +923,18 @@ class TransformersBase(nn.Module):
             self.text_config, "sliding_window", None
         ) or getattr(self.config, "sliding_window", None)
 
-        # Detect encoder-only models (non-causal attention everywhere)
+        # The HF language config is authoritative when it explicitly disables
+        # causality. Decoder attention modules may still declare is_causal=True;
+        # HF normally applies a bidirectional mask, which our callback replaces.
+        bidirectional_text = (
+            getattr(self, "supports_configured_embedding_pooling", False)
+            and not has_model_defined_embedding_architecture(
+                getattr(self.config, "architectures", None)
+            )
+            and getattr(self.text_config, "is_causal", True) is False
+        )
+        # Preserve existing native-encoder detection, but never let a non-causal
+        # vision tower turn an ordinary causal language backbone bidirectional.
         is_encoder_only = any(
             not getattr(m, "is_causal", True)
             for m in self.model.modules()
@@ -926,6 +942,10 @@ class TransformersBase(nn.Module):
         )
         if is_encoder_only and self.config != self.text_config:
             is_encoder_only = False
+        if bidirectional_text and not is_encoder_only:
+            logger.info(
+                "HF language config selects bidirectional full-sequence attention."
+            )
         if is_encoder_only:
             logger.info(
                 "Detected encoder-only model (non-causal attention). "
@@ -953,6 +973,11 @@ class TransformersBase(nn.Module):
                 quant_config=self.quant_config,
                 sliding_window_size=per_layer_sliding_window,
                 is_cross_attention=is_encoder_only,
+                attn_type=(
+                    AttentionType.ENCODER_ONLY
+                    if bidirectional_text and not is_encoder_only
+                    else AttentionType.DECODER
+                ),
                 prefix=f"{idx}.attn",
             )
         return instances
@@ -1130,15 +1155,44 @@ class CausalMixin:
 
 
 class EmbeddingMixin:
+    supports_configured_embedding_pooling = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ignore_unexpected_prefixes.append("lm_head.")
         if not self.pp_group.is_last_rank:
             return
-        pooling_name = str(getattr(self.config, "pooling_type", "LAST")).upper()
-        pooling_type = PoolingType.CLS if pooling_name == "CLS" else PoolingType.LAST
-        normalize = bool(getattr(self.config, "normalize", True))
-        self.pooler = Pooler(pooling_type=pooling_type, normalize=normalize)
+        if has_model_defined_embedding_architecture(
+            getattr(self.config, "architectures", None)
+        ):
+            # Preserve the pre-existing Transformers path for registered encoder
+            # and embedding architectures, including its CLS/LAST convention.
+            pooling_name = str(getattr(self.config, "pooling_type", "LAST")).upper()
+            pooling_type = (
+                PoolingType.CLS if pooling_name == "CLS" else PoolingType.LAST
+            )
+            normalize = bool(getattr(self.config, "normalize", True))
+            if (
+                pooling_name not in ("CLS", "LAST")
+                or getattr(self.config, "pooling", None) is not None
+                or getattr(self.text_config, "is_causal", True) is False
+            ):
+                logger.warning(
+                    "Retaining legacy Transformers pooling/attention for %s; "
+                    "checkpoint-configured semantics are not enabled for this "
+                    "model-defined embedding architecture.",
+                    self.config.architectures,
+                )
+        else:
+            pooling_type = PoolingType[resolve_transformers_pooling(self.config).name]
+            normalize = resolve_embedding_normalize(self.config)
+        self.pooler = Pooler(
+            pooling_type=pooling_type,
+            normalize=normalize,
+            mean_pooling_dtype=(
+                torch.float32 if pooling_type == PoolingType.MEAN else None
+            ),
+        )
 
 
 class MoEMixin:

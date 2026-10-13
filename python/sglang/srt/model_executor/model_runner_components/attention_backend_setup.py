@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.configs.embedding_model_spec import (
+    validate_configured_embedding_attention,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -204,6 +207,12 @@ def _build_resolved_backend(
     resolved: ResolvedAttentionBackendStr,
     init_new_workspace: bool,
 ) -> AttentionBackend:
+    validate_configured_embedding_attention(
+        getattr(
+            getattr(model_runner, "model_config", None), "embedding_model_spec", None
+        ),
+        resolved.prefill,
+    )
     if resolved.is_draft_override:
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,

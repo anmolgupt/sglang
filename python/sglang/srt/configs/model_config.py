@@ -28,7 +28,11 @@ from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
-from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
+from sglang.srt.configs.embedding_model_spec import (
+    declares_checkpoint_embedding_config,
+    has_model_defined_embedding_architecture,
+    resolve_embedding_model_spec,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -568,10 +572,29 @@ class ModelConfig:
             self.hf_config.architectures, self.hf_text_config
         )
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.is_embedding_nemotron3 = is_embedding_nemotron3(self.hf_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
             self.hf_config.architectures,
             is_embedding_requested=bool(is_embedding),
             is_embedding_gemma=self.is_embedding_gemma,
+            is_embedding_nemotron3=self.is_embedding_nemotron3,
+            hf_config=self.hf_config,
+            supports_configured_pooling=(
+                supports_checkpoint_embedding_config(
+                    self.hf_config.architectures, self.model_impl
+                )
+                if (
+                    is_embedding
+                    and not self.is_embedding_gemma
+                    and not self.is_embedding_nemotron3
+                    and "EmbeddingGemma2Model" not in self.hf_config.architectures
+                    and not has_model_defined_embedding_architecture(
+                        self.hf_config.architectures
+                    )
+                    and declares_checkpoint_embedding_config(self.hf_config)
+                )
+                else False
+            ),
         )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
@@ -708,8 +731,10 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = not self.is_embedding_gemma and is_generation_model(
-            self.hf_config.architectures, is_embedding
+        self.is_generation = (
+            not self.is_embedding_gemma
+            and not self.is_embedding_nemotron3
+            and is_generation_model(self.hf_config.architectures, is_embedding)
         )
         # The vision_config/audio_config attribute heuristic is only applied when
         # the transformers backend is explicitly requested. Some text-only models
@@ -2243,6 +2268,44 @@ def is_embedding_gemma(config) -> bool:
     return getattr(config, "model_type", None) == "gemma3_text" and getattr(
         config, "use_bidirectional_attention", False
     )
+
+
+def is_embedding_nemotron3(config) -> bool:
+    """Recognize Nemotron3 embeddings by backbone and explicit embedding metadata.
+
+    The HF backbone name alone also occurs in non-embedding checkpoints.
+    Normalization alone does not declare an embedding attention/pooling policy.
+    """
+    if "Ministral3Model" not in (getattr(config, "architectures", None) or ()):
+        return False
+    return any(
+        getattr(owner, "is_causal", True) is False
+        or getattr(owner, "pooling", None) is not None
+        or getattr(owner, "pooling_type", None) is not None
+        for owner in (config, getattr(config, "text_config", None))
+        if owner is not None
+    )
+
+
+def supports_checkpoint_embedding_config(
+    architectures: List[str], model_impl: ModelImpl
+) -> bool:
+    """Respect existing native model contracts before interpreting HF metadata.
+
+    Match the native-versus-Transformers choice in the loader. Registry access is
+    deferred until ModelConfig construction, avoiding import-time cycles.
+    """
+    if model_impl == ModelImpl.TRANSFORMERS:
+        return True
+    if model_impl == ModelImpl.MINDSPORE:
+        return False
+    from sglang.srt.models.registry import ModelRegistry
+
+    native_archs = [a for a in architectures if ModelRegistry.is_arch_supported(a)]
+    if not native_archs:
+        return True  # The loader selects the Transformers fallback.
+    model_cls, _ = ModelRegistry.resolve_model_cls(native_archs)
+    return bool(getattr(model_cls, "supports_configured_embedding_pooling", False))
 
 
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
