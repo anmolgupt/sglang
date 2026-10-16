@@ -204,6 +204,9 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     # embedding wrapper instead of falling back to the generic HF backend.
     if getattr(model_config, "is_embedding_gemma", False):
         architectures = ["EmbeddingGemmaModel"]
+    # Nemotron-3-Embed is likewise serialized as the bare Ministral3Model.
+    if getattr(model_config, "is_embedding_nemotron3", False):
+        architectures = ["EmbeddingNemotron3Model"]
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
     mixtral_supported = [

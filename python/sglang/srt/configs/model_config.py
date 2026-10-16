@@ -568,10 +568,12 @@ class ModelConfig:
             self.hf_config.architectures, self.hf_text_config
         )
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.is_embedding_nemotron3 = is_embedding_nemotron3(self.hf_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
             self.hf_config.architectures,
             is_embedding_requested=bool(is_embedding),
             is_embedding_gemma=self.is_embedding_gemma,
+            is_embedding_nemotron3=self.is_embedding_nemotron3,
         )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
@@ -708,8 +710,10 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = not self.is_embedding_gemma and is_generation_model(
-            self.hf_config.architectures, is_embedding
+        self.is_generation = (
+            not self.is_embedding_gemma
+            and not self.is_embedding_nemotron3
+            and is_generation_model(self.hf_config.architectures, is_embedding)
         )
         # The vision_config/audio_config attribute heuristic is only applied when
         # the transformers backend is explicitly requested. Some text-only models
@@ -2248,6 +2252,20 @@ def is_embedding_gemma(config) -> bool:
     """
     return getattr(config, "model_type", None) == "gemma3_text" and getattr(
         config, "use_bidirectional_attention", False
+    )
+
+
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    return (
+        "Ministral3Model" in (getattr(config, "architectures", None) or [])
+        and getattr(config, "is_causal", True) is False
+        and getattr(config, "pooling", None) == "avg"
     )
 
 
