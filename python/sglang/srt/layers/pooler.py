@@ -45,10 +45,68 @@ class EmbeddingPoolerOutput:
     pooled_hidden_states: Optional[torch.Tensor | list[torch.Tensor]] = None
 
 
+def _use_cuda_segment_reduce(hidden_states: torch.Tensor) -> bool:
+    # ROCm also reports device.type == "cuda". Do not assume that it, or other
+    # accelerators, implements this optional NVIDIA CUDA optimization.
+    return hidden_states.device.type == "cuda" and torch.version.hip is None
+
+
+def _mean_pool_hidden_states(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if lengths is None and forward_batch.extend_seq_lens.device.type == "cpu":
+        lengths = forward_batch.extend_seq_lens.tolist()
+    if lengths is None:
+        raise ValueError(
+            "MEAN pooling requires extend_seq_lens_cpu for full-prefill length "
+            "validation without a device synchronization."
+        )
+    if (
+        not lengths
+        or any(length <= 0 for length in lengths)
+        or sum(lengths) > hidden_states.shape[0]
+        or len(lengths) != forward_batch.extend_seq_lens.numel()
+    ):
+        raise ValueError(
+            "MEAN pooling requires positive per-request lengths "
+            "that fit the packed hidden states."
+        )
+    accumulation_dtype = (
+        torch.float32
+        if hidden_states.dtype in (torch.bfloat16, torch.float16)
+        else hidden_states.dtype
+    )
+    if _use_cuda_segment_reduce(hidden_states):
+        return torch.segment_reduce(
+            hidden_states.to(accumulation_dtype),
+            "mean",
+            lengths=forward_batch.extend_seq_lens,
+            # Validate scheduler-provided host lengths above, not GPU tensors:
+            # device validation would synchronize and prevent graph capture.
+            unsafe=True,
+        )
+    # Basic per-request reductions avoid a segment_reduce kernel requirement on
+    # CPU, ROCm, NPU, XPU and MUSA. Host lengths are already scheduler metadata;
+    # do not copy device tensors to CPU or use cumulative-endpoint subtraction.
+    means = []
+    offset = 0
+    for length in lengths:
+        means.append(
+            hidden_states[offset : offset + length].mean(
+                dim=0, dtype=accumulation_dtype
+            )
+        )
+        offset += length
+    return torch.stack(means)
+
+
 def pool_hidden_states(
     pooling_type: PoolingType,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
+    *,
+    mean_pooling_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Pool hidden_states by PoolingType (LAST/CLS/MEAN).
 
@@ -64,13 +122,12 @@ def pool_hidden_states(
         first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
         return hidden_states[first_token_flat_indices]
     elif pooling_type == PoolingType.MEAN:
-        prompt_lens = forward_batch.extend_seq_lens
-        end_indices = torch.cumsum(prompt_lens, dim=0) - 1
-        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
-        sums = cumulative_hidden_states[end_indices]
-        preceding_sums = torch.zeros_like(sums)
-        preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
-        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
+        # Even FP32 cumulative-endpoint subtraction can erase a later short
+        # request. Reduce each request independently and accumulate in FP32, but
+        # preserve the legacy output dtype for downstream classifier/projector
+        # heads unless a sentence-embedding pooler explicitly requests FP32.
+        mean = _mean_pool_hidden_states(hidden_states, forward_batch)
+        return mean.to(mean_pooling_dtype or hidden_states.dtype)
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
@@ -243,16 +300,26 @@ class Pooler(nn.Module):
         normalize: Whether to normalize the pooled data.
     """
 
-    def __init__(self, pooling_type: PoolingType, normalize: bool):
+    def __init__(
+        self,
+        pooling_type: PoolingType,
+        normalize: bool,
+        *,
+        mean_pooling_dtype: Optional[torch.dtype] = None,
+    ):
         super().__init__()
         self.pooling_type = pooling_type
         self.normalize = normalize
+        self.mean_pooling_dtype = mean_pooling_dtype
 
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
         pooled_data = pool_hidden_states(
-            self.pooling_type, hidden_states, forward_batch
+            self.pooling_type,
+            hidden_states,
+            forward_batch,
+            mean_pooling_dtype=self.mean_pooling_dtype,
         )
 
         if forward_batch.dimensions is not None:

@@ -28,6 +28,94 @@ sglang serve --model-path google/embeddinggemma-300m
 
 On CUDA, SGLang automatically uses breakable CUDA graph (BCG) for its full encoder prefill and disables incompatible radix-cache and chunked-prefill behavior. Do not add the deprecated piecewise CUDA graph knobs.
 
+### Checkpoint-configured Ministral3 embeddings
+
+`nvidia/Nemotron-3-Embed-1B-BF16` is detected by its `Ministral3Model` backbone
+and explicit embedding metadata (`is_causal: false` and `pooling: avg`). SGLang
+selects the native `EmbeddingNemotron3Model` wrapper without changing the
+checkpoint's on-disk `architectures` value. You do not need `--is-embedding`
+or a language-model head:
+
+```bash
+sglang serve \
+  --model-path nvidia/Nemotron-3-Embed-1B-BF16 \
+  --dtype bfloat16
+```
+
+This command uses the default TP=1 and PP=1. You can use a local checkpoint
+directory instead of the Hugging Face identifier; set `--served-model-name` to
+your client's model identifier in that case. Select an attention backend
+that supports bidirectional prefill on your hardware; pooling does not require
+CUDA. No remote Python code is required by this checkpoint.
+
+Unaudited attention backends fail at startup for the new bidirectional path
+rather than silently using causal attention. You can select
+`--attention-backend torch_native` as a non-causal implementation when it is
+available on your platform. On ROCm, you can also select
+`--attention-backend triton` instead of the unsupported AITER prefill path.
+Existing native models are not subject to this guard. Native Nemotron3
+embeddings currently require `sliding_window=null`; windowed checkpoints fail
+explicitly rather than silently using full attention.
+
+The checkpoint's language `is_causal=false` selects bidirectional attention.
+`pooling: avg` selects MEAN pooling with FP32 accumulation and normalization.
+Prefix reuse and chunked prefill are disabled for this full-sequence path.
+You do not need a causality, pooling or maximum-context override.
+Keep inputs within this checkpoint's published embedding context of 32,768
+tokens. SGLang derives its default context limit from the HF positional config
+(262,144 for this checkpoint), not Sentence-Transformers' `max_seq_length`, so
+the server default does not enforce the narrower embedding limit.
+
+Supply the checkpoint's task prefix as part of each text, for example:
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/embeddings",
+    json={
+        "model": "nvidia/Nemotron-3-Embed-1B-BF16",
+        "input": ["query: Green square", "passage: A plain green square."],
+        "encoding_format": "float",
+    },
+    timeout=60,
+)
+response.raise_for_status()
+vectors = [item["embedding"] for item in response.json()["data"]]
+assert len(vectors) == 2 and all(len(vector) == 2048 for vector in vectors)
+```
+
+Decoder-style models on the
+[Transformers backend](/docs/supported-models/transformers_fallback) also
+support checkpoint-configured pooling and language attention with
+`--is-embedding --model-impl transformers`. Accepted pooling values include
+`last`, `cls`, `mean`, `avg` and `average`; outer metadata takes precedence over
+the language subconfig. Unrecognized legacy pooling values warn and retain
+LAST pooling; unsupported values on the new native Nemotron3 path fail at startup.
+
+The backbone name alone does not auto-enable embedding. Without bidirectional
+attention or pooling metadata, `Ministral3Model` retains the existing
+Transformers fallback; `--is-embedding` still explicitly selects embedding mode.
+Normalization metadata alone does not select the native Nemotron3 wrapper.
+`Ministral3ForCausalLM` and `Mistral3ForConditionalGeneration` are not
+auto-detected by this rule.
+
+Existing model-defined embedding architectures retain their legacy policies,
+including on the Transformers path. Native CausalLM embedding implementations
+also retain their model-defined behavior.
+If that implementation does not support checkpoint-configured semantics,
+SGLang warns about non-LAST pooling or bidirectional metadata that it ignores;
+redundant causal LAST metadata does not warn. Unknown pooling values still warn.
+Select the Transformers backend if
+you intend to use those semantics, rather than assuming the native model honors
+them.
+
+<Warning>
+Native and Hugging Face BF16 kernels can produce different rounding results.
+Validate numerical tolerances and retrieval quality for your application;
+successful requests alone do not establish numerical equivalence.
+</Warning>
+
 ### Client Request
 
 ```python

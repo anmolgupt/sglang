@@ -118,5 +118,59 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
     assert result.name == "resolved"
 
 
+@pytest.mark.parametrize("backend", ["aiter", "wave", "ascend"])
+def test_configured_bidirectional_rejects_unaudited_backend_before_construction(
+    backend,
+):
+    from sglang.srt.configs.embedding_model_spec import CONFIGURED_POOLING_EMBEDDING
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            embedding_model_spec=SimpleNamespace(
+                family=CONFIGURED_POOLING_EMBEDDING, bidirectional_attention=True
+            )
+        )
+    )
+    resolved = ResolvedAttentionBackendStr(prefill=backend, decode=backend)
+    with patch.dict(
+        attention_backend_setup.ATTENTION_BACKENDS,
+        {backend: lambda _runner: pytest.fail("Backend must not be constructed")},
+    ):
+        with pytest.raises(ValueError, match="--attention-backend torch_native"):
+            attention_backend_setup._build_resolved_backend(
+                model_runner=runner, resolved=resolved, init_new_workspace=False
+            )
+
+
+@pytest.mark.parametrize("backend", ["intel_amx", "intel_xpu"])
+def test_configured_bidirectional_accepts_non_cuda_backend_factory(backend):
+    from sglang.srt.configs.embedding_model_spec import CONFIGURED_POOLING_EMBEDDING
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            embedding_model_spec=SimpleNamespace(
+                family=CONFIGURED_POOLING_EMBEDDING, bidirectional_attention=True
+            )
+        ),
+        init_new_workspace=None,
+    )
+    resolved = ResolvedAttentionBackendStr(prefill=backend, decode=backend)
+    with (
+        patch.dict(
+            attention_backend_setup.ATTENTION_BACKENDS,
+            {backend: lambda _runner: _FakeBackend(backend)},
+        ),
+        patch.object(
+            attention_backend_setup,
+            "attn_backend_wrapper",
+            side_effect=lambda _runner, full_backend: full_backend,
+        ),
+    ):
+        result = attention_backend_setup._build_resolved_backend(
+            model_runner=runner, resolved=resolved, init_new_workspace=False
+        )
+    assert result.name == backend
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

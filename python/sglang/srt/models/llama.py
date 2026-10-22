@@ -572,7 +572,14 @@ class LlamaForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.stacked_params_mapping = [
+        self.stacked_params_mapping = self._get_stacked_params_mapping()
+
+        self.capture_aux_hidden_states = False
+
+    @staticmethod
+    def _get_stacked_params_mapping():
+        # Shared with bare-backbone wrappers that must not construct an LM head.
+        return [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -580,8 +587,6 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
-
-        self.capture_aux_hidden_states = False
 
     def _init_model(
         self,
@@ -699,14 +704,7 @@ class LlamaForCausalLM(nn.Module):
         return self._legacy_load_weights(weights)
 
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
+        stacked_params_mapping = self._get_stacked_params_mapping()
 
         params_dict = dict(self.named_parameters())
 
