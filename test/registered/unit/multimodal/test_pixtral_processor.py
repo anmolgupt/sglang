@@ -1,6 +1,7 @@
 """Regression tests for Pixtral multimodal item processing."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -35,7 +36,7 @@ class TestPixtralProcessor(CustomTestCase):
         processor._wrap_tensor_for_cuda_ipc = MagicMock(side_effect=proxies)
 
         feature = torch.arange(8).reshape(2, 4)
-        image_sizes = torch.tensor([[10, 20], [30, 40]])
+        image_sizes = torch.tensor([[56, 28], [84, 28]])
         bundled_item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=feature,
@@ -106,11 +107,79 @@ class TestPixtralProcessor(CustomTestCase):
             modality=Modality.IMAGE,
             feature=torch.arange(8).reshape(2, 4),
             offsets=[(0, 0), (1, 1)],
+            model_specific_data={"image_sizes": torch.tensor([[56, 28], [84, 28]])},
         )
         images = [Image.new("RGB", (28, 56)), Image.new("RGB", (28, 84))]
 
         with self.assertRaisesRegex(ValueError, "patch rows"):
             processor._finalize_mm_items([item], images=images)
+
+    def test_rows_follow_processor_longest_edge(self):
+        """Rows come from the resized image, not from vision_config.image_size."""
+        processor = self._make_processor()
+        processor.image_size = 1540
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[object(), object()]
+        )
+        # longest_edge=1120 resizes each 1540x1540 page to 1120x1120: 40 rows.
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.arange(8).reshape(2, 4),
+            offsets=[(row, row) for row in range(80)],
+            model_specific_data={
+                "image_sizes": torch.tensor([[1120, 1120], [1120, 1120]])
+            },
+        )
+        images = [Image.new("RGB", (1540, 1540))] * 2
+
+        items = processor._finalize_mm_items([item], images=images)
+
+        self.assertEqual([len(item.offsets) for item in items], [40, 40])
+
+    def test_request_longest_edge_is_forwarded(self):
+        processor = self._make_processor()
+        request = SimpleNamespace(mm_processor_kwargs={"size": {"longest_edge": 896}})
+
+        self.assertEqual(
+            processor._request_processor_kwargs(request),
+            {"images_kwargs": {"size": {"longest_edge": 896}}},
+        )
+        self.assertEqual(processor._request_processor_kwargs(SimpleNamespace()), {})
+
+    def test_request_images_kwargs_override_server_image_config(self):
+        processor = self._make_processor()
+        processor.image_config = {"size": {"longest_edge": 1120}, "do_resize": True}
+        processor.disable_fast_image_processor = True
+        processor._tokenizer_auto_adds_specials = False
+        processor.mm_feature_transport = "cpu"
+        processor.FEATURE_NAMES = []
+        hf_processor = MagicMock(return_value={})
+
+        processor.process_mm_data(
+            "[IMG]",
+            images=[Image.new("RGB", (28, 28))],
+            processor=hf_processor,
+            images_kwargs={"size": {"longest_edge": 896}},
+        )
+
+        self.assertEqual(
+            hf_processor.call_args.kwargs["images_kwargs"],
+            {"size": {"longest_edge": 896}, "do_resize": True},
+        )
+
+    def test_invalid_request_processor_kwargs_are_rejected(self):
+        processor = self._make_processor()
+        for mm_processor_kwargs in (
+            {"size": {"longest_edge": 2048}},
+            {"size": {"longest_edge": 0}},
+            {"size": {"longest_edge": "896"}},
+            {"size": {"height": 896, "width": 896}},
+            {"do_resize": False},
+        ):
+            with self.subTest(mm_processor_kwargs=mm_processor_kwargs):
+                request = SimpleNamespace(mm_processor_kwargs=mm_processor_kwargs)
+                with self.assertRaises(ValueError):
+                    processor._request_processor_kwargs(request)
 
 
 if __name__ == "__main__":
