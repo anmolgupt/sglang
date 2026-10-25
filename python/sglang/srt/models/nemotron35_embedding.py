@@ -9,6 +9,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
@@ -50,13 +51,32 @@ class EmbeddingNemotron35Model(nn.Module):
         return self.vision_tower.pad_input_ids(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        features = []
+        # One vision pass for the images of all requests in the batch (in item
+        # order), instead of one per request: per-image passes leave the GPU
+        # idle between small launches. Passes are capped at
+        # SGLANG_NEMOTRON35_VIT_MAX_PATCHES patches to bound activation memory.
+        images, sizes = [], []
         for item in items:
-            image_features = self.vision_tower(item.feature, item.image_sizes)
-            features.append(
-                self.multi_modal_projector(image_features.squeeze(0), item.image_sizes)
-            )
+            for pixels, (h, w) in zip(item.feature, item.image_sizes):
+                images.append(pixels[:, :h, :w])
+                sizes.append((h, w))
+        patch = self.vision_tower.patch_size
+        budget = envs.SGLANG_NEMOTRON35_VIT_MAX_PATCHES.get()
+        features, chunk, chunk_patches = [], [], 0
+        for i, (h, w) in enumerate(sizes):
+            patches = (h // patch) * (w // patch)
+            if chunk and chunk_patches + patches > budget:
+                features.append(self._image_features(images, sizes, chunk))
+                chunk, chunk_patches = [], 0
+            chunk.append(i)
+            chunk_patches += patches
+        features.append(self._image_features(images, sizes, chunk))
         return torch.cat(features, dim=0)
+
+    def _image_features(self, images, sizes, indices: List[int]) -> torch.Tensor:
+        chunk_sizes = [sizes[i] for i in indices]
+        image_features = self.vision_tower([images[i] for i in indices], chunk_sizes)
+        return self.multi_modal_projector(image_features.squeeze(0), chunk_sizes)
 
     @torch.no_grad()
     def forward(

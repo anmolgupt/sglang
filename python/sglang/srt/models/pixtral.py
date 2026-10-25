@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+import itertools
 from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -571,6 +572,8 @@ class PixtralHFTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         # Ensure hidden_states has the batch dimension [batch, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -584,8 +587,9 @@ class PixtralHFTransformerBlock(nn.Module):
         attention_output = self.attention(
             attn_normalized,
             attention_mask=attention_mask,
-            cu_seqlens=None,
+            cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
         )
 
         # Apply first residual connection
@@ -796,6 +800,8 @@ class PixtralHFTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         return_all_hidden_states: bool = False,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Forward pass through transformer layers.
 
@@ -804,6 +810,8 @@ class PixtralHFTransformer(nn.Module):
             attention_mask: Optional attention mask
             position_embeddings: Optional position embeddings for rotary attention
             return_all_hidden_states: Whether to return all hidden states
+            cu_seqlens: Optional per-image sequence boundaries (varlen attention)
+            max_seqlen: Longest image sequence, so backends need not sync to find it
 
         Returns:
             Either the final hidden state, or a list of all hidden states if
@@ -814,7 +822,13 @@ class PixtralHFTransformer(nn.Module):
         all_hidden_states = [hidden_states] if return_all_hidden_states else None
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, attention_mask, position_embeddings)
+            hidden_states = layer(
+                hidden_states,
+                attention_mask,
+                position_embeddings,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
             if return_all_hidden_states:
                 all_hidden_states.append(hidden_states)
 
@@ -862,6 +876,10 @@ def resolve_visual_encoder_outputs(
         combined_outputs = post_norm(combined_outputs)
 
     return combined_outputs
+
+
+# Vision attention backends that attend within cu_seqlens boundaries.
+_VARLEN_VISION_BACKENDS = frozenset({"triton_attn", "fa3", "fa4", "flashinfer_cudnn"})
 
 
 class PixtralHFVisionModel(nn.Module):
@@ -924,16 +942,23 @@ class PixtralHFVisionModel(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    @property
+    def _varlen_attention(self) -> bool:
+        """Whether the vision attention backend takes per-sequence cu_seqlens."""
+        backend = self.transformer.layers[0].attention.qkv_backend_name
+        return backend in _VARLEN_VISION_BACKENDS
+
     def forward(
         self,
-        pixel_values: torch.Tensor,
+        pixel_values: Union[torch.Tensor, List[torch.Tensor]],
         image_sizes: list[tuple[int, int]],
         output_hidden_states: bool = False,
         feature_sample_layers: Optional[list[int]] = None,
     ) -> Union[torch.Tensor, tuple]:
         """
         Args:
-            pixel_values: [batch_size, C, H, W], padded if multiple images
+            pixel_values: [batch_size, C, H, W], padded if multiple images, or a
+                list of unpadded [C, H, W] images
             image_sizes: list of (H, W) for each image in the batch
             output_hidden_states: Whether to return all hidden states.
             feature_sample_layers: Layer indices whose features should be
@@ -945,15 +970,27 @@ class PixtralHFVisionModel(nn.Module):
               - hidden_states: Final model outputs (or selected layers if feature_sample_layers given)
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
-        # batch patch images
-        embeds_orig = self.patch_conv(
-            pixel_values.to(device=self.device, dtype=self.dtype)
-        )
-        # crop the embeddings
-        embeds_2d = [
-            embed[..., : h // self.patch_size, : w // self.patch_size]
-            for embed, (h, w) in zip(embeds_orig, image_sizes)
-        ]
+        if isinstance(pixel_values, (list, tuple)):
+            # Images of different sizes: patchify each one instead of padding
+            # them all to the largest.
+            embeds_2d = [
+                self.patch_conv(
+                    img.to(device=self.device, dtype=self.dtype, non_blocking=True)[
+                        None
+                    ]
+                )[0][..., : h // self.patch_size, : w // self.patch_size]
+                for img, (h, w) in zip(pixel_values, image_sizes)
+            ]
+        else:
+            # batch patch images
+            embeds_orig = self.patch_conv(
+                pixel_values.to(device=self.device, dtype=self.dtype)
+            )
+            # crop the embeddings
+            embeds_2d = [
+                embed[..., : h // self.patch_size, : w // self.patch_size]
+                for embed, (h, w) in zip(embeds_orig, image_sizes)
+            ]
 
         # flatten to sequence
         embeds_1d = torch.cat([p.flatten(1).T for p in embeds_2d], dim=0)
@@ -966,9 +1003,19 @@ class PixtralHFVisionModel(nn.Module):
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )
-        attention_mask = _get_pixtral_attention_mask(
-            [p.shape[-2] * p.shape[-1] for p in embeds_2d], embeds_featurized
-        )
+        seq_lens = [p.shape[-2] * p.shape[-1] for p in embeds_2d]
+        cu_seqlens = max_seqlen = attention_mask = None
+        if len(seq_lens) > 1 and self._varlen_attention:
+            # Varlen backends read only cu_seqlens (they ignore attention_mask),
+            # so several images in one pass need per-image boundaries; it also
+            # avoids the O(total_patches^2) dense block mask.
+            # On the device once per pass: the triton backend uses it as is.
+            cu_seqlens = torch.tensor(
+                [0] + list(itertools.accumulate(seq_lens)), dtype=torch.int32
+            ).to(self.device, non_blocking=True)
+            max_seqlen = max(seq_lens)
+        else:
+            attention_mask = _get_pixtral_attention_mask(seq_lens, embeds_featurized)
 
         return_all_hidden_states = (
             output_hidden_states or feature_sample_layers is not None
@@ -979,6 +1026,8 @@ class PixtralHFVisionModel(nn.Module):
             attention_mask,
             position_embedding,
             return_all_hidden_states=return_all_hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
 
         # Store all hidden states if requested

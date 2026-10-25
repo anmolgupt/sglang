@@ -1531,6 +1531,9 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Patches per Nemotron-3.5-Embed vision pass (images of a batch are packed
+    # into passes up to this budget; one image larger than it gets its own pass).
+    SGLANG_NEMOTRON35_VIT_MAX_PATCHES = EnvInt(65536)
     # Currently supported by the Kimi-K2.5 image processor only.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
