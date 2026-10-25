@@ -1534,6 +1534,9 @@ class Envs:
     # Patches per Nemotron-3.5-Embed vision pass (images of a batch are packed
     # into passes up to this budget; one image larger than it gets its own pass).
     SGLANG_NEMOTRON35_VIT_MAX_PATCHES = EnvInt(65536)
+    # Fuse RMSNorm (+ residual add) with the NVFP4 activation quantization of the
+    # W4A4 NVFP4 linear that consumes it (FlashInfer CuTe-DSL kernel, SM100+).
+    SGLANG_NVFP4_FUSE_NORM_QUANT = EnvBool(False)
     # Currently supported by the Kimi-K2.5 image processor only.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,

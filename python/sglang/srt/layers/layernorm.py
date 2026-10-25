@@ -57,6 +57,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
+_flashinfer_rmsnorm_fp4quant_available = False
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -95,6 +96,19 @@ if _is_cuda or _is_xpu or _is_musa:
             _flashinfer_rmsnorm_quant_available = True
         except (ImportError, AttributeError):
             _flashinfer_rmsnorm_quant_available = False
+
+        try:
+            # CuTe-DSL fused (add +) RMSNorm + NVFP4 quantization (SM100+).
+            from flashinfer.norm import (
+                add_rmsnorm_fp4quant as _flashinfer_add_rmsnorm_fp4quant,
+            )
+            from flashinfer.norm import (
+                rmsnorm_fp4quant as _flashinfer_rmsnorm_fp4quant,
+            )
+
+            _flashinfer_rmsnorm_fp4quant_available = True
+        except (ImportError, AttributeError):
+            _flashinfer_rmsnorm_fp4quant_available = False
     else:
         _flashinfer_layernorm_available = False
         _flashinfer_rmsnorm_quant_available = False
@@ -404,6 +418,18 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
+def _nvfp4_input_global_scale(linear) -> Optional[torch.Tensor]:
+    """Return the input global scale of ``linear`` if it is a W4A4 NVFP4 linear
+    that can consume a pre-quantized ``(fp4, block_scale, dtype)`` input and
+    SGLANG_NVFP4_FUSE_NORM_QUANT is set; otherwise ``None``."""
+    if linear is None or not envs.SGLANG_NVFP4_FUSE_NORM_QUANT.get():
+        return None
+    scheme = getattr(linear, "scheme", None)
+    if not getattr(scheme, "accepts_prequantized_input", False):
+        return None
+    return getattr(linear, "input_global_scale", None)
+
+
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     """Return the per-tensor static FP8 activation scale of ``linear`` if it is
     an FP8 linear using static per-tensor activation scaling that can consume a
@@ -564,6 +590,18 @@ class RMSNorm(BaseFusedOp):
             if scale is not None:
                 return self.forward_with_per_tensor_quant_fusion(
                     x, scale, residual, post_residual_addition
+                )
+        # Same for a downstream W4A4 NVFP4 linear: norm + NVFP4 activation quant
+        # in one kernel (vLLM's fuse_norm_quant uses the same FlashInfer kernel).
+        if (
+            quant_linear is not None
+            and not self.cast_x_before_out_mul
+            and _flashinfer_rmsnorm_fp4quant_available
+        ):
+            global_scale = _nvfp4_input_global_scale(quant_linear)
+            if global_scale is not None:
+                return self.forward_with_nvfp4_quant_fusion(
+                    x, global_scale, residual, post_residual_addition
                 )
 
         # CUDA RMSNorm kernels require 2D inputs. Flatten token dimensions for
@@ -955,6 +993,64 @@ class RMSNorm(BaseFusedOp):
         return _forward_with_allreduce_fusion_quant_per_group(
             self, x, residual, self.weight, group_size, use_attn_tp_group, keep_bf16
         )
+
+    def forward_with_nvfp4_quant_fusion(
+        self,
+        x: torch.Tensor,
+        global_scale: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        """Fused (residual add +) RMSNorm + NVFP4 quantization.
+
+        Emits the activation in the layout ``fp4_quantize`` produces for the
+        W4A4 NVFP4 GEMM: packed FP4 values ``[tokens, hidden // 2]`` (uint8) and
+        E4M3 block scales swizzled into 128x4 tiles, padded to
+        ``[round_up(tokens, 128), round_up(hidden // 16, 4)]`` (uint8), plus the
+        un-quantized dtype for the GEMM output.
+
+        Return contract mirrors ``forward_with_per_tensor_quant_fusion``:
+        * no residual -> ``(fp4, block_scale, orig_dtype)``
+        * w/ residual -> ``((fp4, block_scale, orig_dtype), residual_out)``
+        """
+        orig_dtype = x.dtype
+        hidden = x.shape[-1]
+        x = x.contiguous().reshape(-1, hidden)
+        tokens = x.shape[0]
+        out = torch.empty((tokens, hidden // 2), dtype=torch.uint8, device=x.device)
+        block_scale = torch.empty(
+            ((tokens + 127) // 128 * 128, (hidden // 16 + 3) // 4 * 4),
+            dtype=torch.uint8,
+            device=x.device,
+        )
+        common = dict(
+            y_fp4=out.view(torch.float4_e2m1fn_x2),
+            block_scale=block_scale.view(torch.float8_e4m3fn),
+            global_scale=global_scale.reshape(1),
+            eps=self.variance_epsilon,
+            block_size=16,
+            scale_format="e4m3",
+            is_sf_swizzled_layout=True,
+        )
+        if residual is None:
+            _flashinfer_rmsnorm_fp4quant(x, self.weight.data, **common)
+            return out, block_scale, orig_dtype
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        residual_shape = residual.shape
+        residual = residual.contiguous().reshape(-1, hidden)
+        # In-place: residual += x, then out = quant(rmsnorm(residual) * w).
+        # FlashInfer validates the unswizzled scale buffer even when unused.
+        _flashinfer_add_rmsnorm_fp4quant(
+            x,
+            residual,
+            self.weight.data,
+            block_scale_unswizzled=torch.empty(
+                (tokens, hidden // 16), dtype=torch.float8_e4m3fn, device=x.device
+            ),
+            **common,
+        )
+        return (out, block_scale, orig_dtype), residual.reshape(residual_shape)
 
     def forward_with_per_tensor_quant_fusion(
         self,
