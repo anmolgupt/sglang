@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
@@ -24,8 +25,55 @@ from sglang.srt.models.pixtral import PixtralHFVisionModel
 from sglang.srt.utils import add_prefix
 
 
+class Nemotron35MultiModalProjector(Mistral3MultiModalProjector):
+    """The HF Mistral3 projector with SGLang linears, so a quantized checkpoint
+    (e.g. NVFP4 ``multi_modal_projector.linear_1/2``) loads; the norm and the
+    patch merger stay as in HF."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config)
+        bias = config.multimodal_projector_bias
+        self.linear_1 = ReplicatedLinear(
+            self.linear_1.in_features,
+            self.linear_1.out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=add_prefix("linear_1", prefix),
+        )
+        self.linear_2 = ReplicatedLinear(
+            self.linear_2.in_features,
+            self.linear_2.out_features,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=add_prefix("linear_2", prefix),
+        )
+
+    def forward(self, image_features: torch.Tensor, image_sizes) -> torch.Tensor:
+        image_features = self.norm(image_features)
+        image_features = self.patch_merger(image_features, image_sizes)
+        hidden_states, _ = self.linear_1(image_features)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class EmbeddingNemotron35Model(nn.Module):
     """Nemotron-3.5-Embed: image and text inputs share one bidirectional pass."""
+
+    # Fused SGLang modules -> checkpoint modules, so quantization configs that
+    # name the unfused projections (compressed-tensors NVFP4) match them. The
+    # vision attention output projection is `attention.proj` here, `o_proj`
+    # in the checkpoint.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "attention.proj": ["attention.o_proj"],
+    }
 
     def __init__(
         self,
@@ -40,7 +88,11 @@ class EmbeddingNemotron35Model(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
         )
-        self.multi_modal_projector = Mistral3MultiModalProjector(config)
+        self.multi_modal_projector = Nemotron35MultiModalProjector(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("multi_modal_projector", prefix),
+        )
         self.language_model = EmbeddingNemotron3Model(
             config.text_config,
             quant_config=quant_config,
