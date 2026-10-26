@@ -734,6 +734,17 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _many_tokenizer_workers(self) -> bool:
+        """Whether several tokenizer worker processes each run this processor.
+
+        Each worker that ran the fast image processor on the GPU would open its
+        own CUDA context next to the scheduler's static memory pool; with 16
+        workers on a 32 GB GPU image requests then fail with CUDA out-of-memory
+        or "device busy" errors. Those workers preprocess on the CPU instead,
+        where they are also real parallelism.
+        """
+        return getattr(self.server_args, "tokenizer_worker_num", 1) > 1
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
@@ -743,7 +754,7 @@ class BaseMultimodalProcessor(ABC):
         """
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
-        if self.disable_fast_image_processor:
+        if self.disable_fast_image_processor or self._many_tokenizer_workers():
             return False
         image_processor = getattr(self._processor, "image_processor", None)
         if not isinstance(image_processor, BaseImageProcessor):
@@ -788,7 +799,7 @@ class BaseMultimodalProcessor(ABC):
             return "xpu"
         if not _is_npu:
             platform = platforms.current_platform
-            if not platform.is_cuda_alike():
+            if not platform.is_cuda_alike() or self._many_tokenizer_workers():
                 return None
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
@@ -863,7 +874,11 @@ class BaseMultimodalProcessor(ABC):
         if images:
             kwargs["images"] = images
             if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+                # Server-level image config is the default; per-request kwargs win.
+                kwargs["images_kwargs"] = {
+                    **self.image_config,
+                    **kwargs.get("images_kwargs", {}),
+                }
         if videos:
             kwargs["videos"] = videos
             video_config = (

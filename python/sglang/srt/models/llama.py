@@ -445,7 +445,9 @@ class LlamaModel(nn.Module):
                 start_layer=pp_start_layer,
                 prefix=prefix,
             ),
-            prefix="model.layers",
+            # Nested models (e.g. a multimodal model's language_model) need their own
+            # prefix in the layer names that quantization configs match against.
+            prefix=add_prefix("layers", prefix) if prefix else "model.layers",
             stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
         )
 
