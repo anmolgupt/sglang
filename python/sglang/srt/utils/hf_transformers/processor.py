@@ -65,7 +65,11 @@ def resolve_image_processor_backend(mm_config) -> str:
     """
     if getattr(mm_config, "disable_fast_image_processor", False):
         return "pil"
-    return getattr(mm_config, "image_processor_backend", "auto")
+    backend = getattr(mm_config, "image_processor_backend", "auto")
+    # Models that defer preprocessing to the GPU still load the PIL processor:
+    # it plans the images, and every path that preprocesses in the tokenizer
+    # worker gives the same result as the deferred one.
+    return "pil" if backend == "scheduler" else backend
 
 
 def _normalize_image_processor_backend(

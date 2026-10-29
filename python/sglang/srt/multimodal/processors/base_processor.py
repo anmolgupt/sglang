@@ -295,7 +295,10 @@ class BaseMultimodalProcessor(ABC):
         self.image_processor_backend = get_mm().image_processor_backend
         if get_mm().disable_fast_image_processor:
             self.image_processor_backend = "pil"
-        self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        self.disable_fast_image_processor = self.image_processor_backend in (
+            "pil",
+            "scheduler",
+        )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config

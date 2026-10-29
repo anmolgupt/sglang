@@ -74,6 +74,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.qwen_vl_image_processing import finish_deferred_images
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
@@ -763,6 +764,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # Images sent as uint8 (--image-processor-backend scheduler) become
+        # patches here, on the vision tower's GPU.
+        finish_deferred_images(items, device=self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
