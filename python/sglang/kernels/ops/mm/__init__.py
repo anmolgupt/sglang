@@ -27,6 +27,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="mm.bicubic_resize",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mm.process.lanczos:bicubic_resize",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="mm.normalize_and_patchify",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.mm.process.image:_normalize_and_patchify_torch",
