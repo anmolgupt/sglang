@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU RGB Lanczos resize with optional crop and normalization."""
+"""GPU RGB resize matching Pillow (Lanczos, bicubic) with optional crop and normalization."""
 
 import math
 from functools import lru_cache
@@ -17,12 +17,34 @@ def _sinc(value: float) -> float:
     return math.sin(angle) / angle
 
 
+def _lanczos(distance: float) -> float:
+    if -3.0 <= distance < 3.0:
+        return _sinc(distance) * _sinc(distance / 3.0)
+    return 0.0
+
+
+def _bicubic(distance: float) -> float:
+    # Pillow's bicubic filter (a = -0.5).
+    a = -0.5
+    distance = abs(distance)
+    if distance < 1.0:
+        return ((a + 2.0) * distance - (a + 3.0)) * distance * distance + 1.0
+    if distance < 2.0:
+        return (((distance - 5.0) * distance + 8.0) * distance - 4.0) * a
+    return 0.0
+
+
+# Pillow's resampling filters: (support, weight function).
+_FILTERS = {"lanczos": (3.0, _lanczos), "bicubic": (2.0, _bicubic)}
+
+
 @lru_cache(maxsize=128)
-def _coefficients(source: int, target: int, device: torch.device):
+def _coefficients(source: int, target: int, device: torch.device, filter_name: str):
     """Pillow's RGB resampling uses normalized signed 22-bit coefficients."""
+    filter_support, filter_fn = _FILTERS[filter_name]
     scale = source / target
     filter_scale = max(scale, 1.0)
-    support = 3.0 * filter_scale
+    support = filter_support * filter_scale
     inv_filter_scale = 1.0 / filter_scale
     taps = math.ceil(support) * 2 + 1
     coefficients = np.zeros((target, taps), dtype=np.int32)
@@ -34,11 +56,7 @@ def _coefficients(source: int, target: int, device: torch.device):
         weights = []
         for pos in range(begin, end):
             distance = (pos - center + 0.5) * inv_filter_scale
-            weights.append(
-                _sinc(distance) * _sinc(distance / 3.0)
-                if -3.0 <= distance < 3.0
-                else 0.0
-            )
+            weights.append(filter_fn(distance))
         # Keep sequential double accumulation, including on Python versions
         # whose sum() uses compensated summation.
         total = 0.0
@@ -81,7 +99,7 @@ def _normalization(
         "taps",
     ]
 )
-def _horizontal_lanczos(
+def _horizontal_resample(
     src,
     dst,
     coefficients,
@@ -122,7 +140,7 @@ def _horizontal_lanczos(
 
 
 @triton.jit(do_not_specialize=["crop_top", "stride_batch", "taps"])
-def _vertical_lanczos(
+def _vertical_resample(
     src,
     dst,
     coefficients,
@@ -178,9 +196,44 @@ def lanczos_resize(
     mean: tuple[float, float, float] | None = None,
     std: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
+    """Pillow ``Image.resize(..., LANCZOS)`` of CUDA uint8 RGB; see ``_resize_rgb``."""
+    return _resize_rgb(
+        image, height, width, filter_name="lanczos", crop=crop, mean=mean, std=std
+    )
+
+
+def bicubic_resize(
+    image: torch.Tensor,
+    height: int,
+    width: int,
+    *,
+    crop: tuple[int, int, int, int] | None = None,
+    mean: tuple[float, float, float] | None = None,
+    std: tuple[float, float, float] | None = None,
+) -> torch.Tensor:
+    """Pillow ``Image.resize(..., BICUBIC)`` of CUDA uint8 RGB; see ``_resize_rgb``.
+
+    PyTorch's CUDA bicubic, also with ``antialias=True``, differs from Pillow's
+    by up to tens of 8-bit levels on document images."""
+    return _resize_rgb(
+        image, height, width, filter_name="bicubic", crop=crop, mean=mean, std=std
+    )
+
+
+def _resize_rgb(
+    image: torch.Tensor,
+    height: int,
+    width: int,
+    *,
+    filter_name: str,
+    crop: tuple[int, int, int, int] | None,
+    mean: tuple[float, float, float] | None,
+    std: tuple[float, float, float] | None,
+) -> torch.Tensor:
     """Resize CUDA uint8 HWC/NHWC RGB to ``height x width``, preserving layout.
 
-    By default, return uint8 pixels matching Pillow's two-pass Lanczos rounding.
+    By default, return uint8 pixels matching Pillow's two-pass rounding with the
+    ``filter_name`` filter.
     Optional ``crop=(top, left, height, width)`` selects an in-bounds rectangle
     in the resized image. Providing both RGB ``mean`` and ``std`` fuses
     ``(pixel / 255 - mean) / std`` and returns float32 instead.
@@ -191,13 +244,18 @@ def lanczos_resize(
     on the current PyTorch CUDA stream.
     """
     if not image.is_cuda or torch.version.hip is not None:
-        raise ValueError("Lanczos RGB preprocessing requires a CUDA tensor")
+        raise ValueError(
+            f"{filter_name.capitalize()} RGB preprocessing requires a CUDA tensor"
+        )
     if image.dtype != torch.uint8 or image.ndim not in (3, 4) or image.shape[-1] != 3:
         raise ValueError(
-            "Lanczos RGB input must be uint8 with shape [H, W, 3] or [N, H, W, 3]"
+            f"{filter_name.capitalize()} RGB input must be uint8 with shape "
+            "[H, W, 3] or [N, H, W, 3]"
         )
     if height <= 0 or width <= 0 or any(size <= 0 for size in image.shape):
-        raise ValueError("Lanczos RGB input and output dimensions must be positive")
+        raise ValueError(
+            f"{filter_name.capitalize()} RGB input and output dimensions must be positive"
+        )
     if crop is None:
         top, left, output_h, output_w = 0, 0, height, width
     else:
@@ -237,8 +295,12 @@ def lanczos_resize(
         return output
     batch_size = image.shape[0] if image.ndim == 4 else 1
     stride_batch = image.stride(0) if image.ndim == 4 else 0
-    coeff_x, bounds_x, taps_x = _coefficients(source_w, width, image.device)
-    coeff_y, bounds_y, taps_y = _coefficients(source_h, height, image.device)
+    coeff_x, bounds_x, taps_x = _coefficients(
+        source_w, width, image.device, filter_name
+    )
+    coeff_y, bounds_y, taps_y = _coefficients(
+        source_h, height, image.device, filter_name
+    )
     intermediate = torch.empty(
         (batch_size, source_h, output_w, 3), dtype=torch.uint8, device=image.device
     )
@@ -247,7 +309,7 @@ def lanczos_resize(
         dtype=torch.float32 if normalize else torch.uint8,
         device=image.device,
     )
-    _horizontal_lanczos[(triton.cdiv(source_h * output_w * 3, 256), batch_size)](
+    _horizontal_resample[(triton.cdiv(source_h * output_w * 3, 256), batch_size)](
         image,
         intermediate,
         coeff_x,
@@ -260,7 +322,7 @@ def lanczos_resize(
         taps_x,
         256,
     )
-    _vertical_lanczos[(triton.cdiv(output_h * output_w * 3, 256), batch_size)](
+    _vertical_resample[(triton.cdiv(output_h * output_w * 3, 256), batch_size)](
         intermediate,
         output,
         coeff_y,

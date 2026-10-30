@@ -126,9 +126,11 @@ class Mm(msgspec.Struct):
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
     ] = False
     image_processor_backend: A[
-        Literal["auto", "torchvision", "pil"],
+        Literal["auto", "torchvision", "pil", "scheduler"],
         "Image processor backend. 'auto' lets Transformers select the best "
-        "available backend.",
+        "available backend. 'scheduler' sends uint8 images and preprocesses them "
+        "on the vision encoder's GPU, matching 'pil' (Qwen2-VL and Qwen2.5-VL; "
+        "other models use 'pil').",
     ] = "auto"
     mm_global_cache_backend: A[
         str,

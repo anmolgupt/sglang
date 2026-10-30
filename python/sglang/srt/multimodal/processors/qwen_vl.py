@@ -48,11 +48,17 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.qwen_vl_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    can_defer,
+    plan_image,
+    to_hwc_uint8,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -372,6 +378,17 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.auto_mm_processor_worker_num = 2
             self.auto_mm_io_worker_num = 16
             self.supports_mm_processor_concurrency = True
+        # --image-processor-backend scheduler: send uint8 images and preprocess
+        # them on the vision encoder's GPU (see qwen_vl_image_processing).
+        self.defer_image_preprocessing = (
+            get_mm().image_processor_backend == "scheduler"
+            and is_cuda()
+            and self.model_type in ("qwen2_vl", "qwen2_5_vl")
+            and get_mm().mm_feature_transport in (None, "cpu")
+            and can_defer(_processor.image_processor)
+        )
+        if self.defer_image_preprocessing:
+            self.uses_media_artifacts_without_cache = True
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
@@ -790,6 +807,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             return []
 
         processor, _ = self._resolve_processor(processor)
+        if self.defer_image_preprocessing:
+            return self._prepare_deferred_artifacts(entries, processor)
         image_kwargs = dict(self.image_config or {})
         processor_device = None
         if (
@@ -857,6 +876,35 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     feature_hash=feature_hash,
                     feature=feature,
                     model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
+                )
+            )
+        return artifacts
+
+    def _prepare_deferred_artifacts(
+        self, entries: list[MediaArtifactInput], processor
+    ) -> list[QwenVLImagePreprocessArtifact]:
+        """uint8 images planned on the CPU; the model finishes them on its GPU."""
+        artifacts = []
+        for entry in entries:
+            image = to_hwc_uint8(entry.media)
+            config = plan_image(
+                processor.image_processor,
+                height=image.shape[0],
+                width=image.shape[1],
+                overrides=self.image_config or {},
+            )
+            artifacts.append(
+                QwenVLImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=resolve_multimodal_item_hash(
+                        existing_hash=0, namespace=entry.artifact_key
+                    ),
+                    feature=image,
+                    model_specific_data={
+                        "image_grid_thw": config.grid_thw,
+                        DEFERRED_PREPROCESSING_KEY: config,
+                    },
                 )
             )
         return artifacts

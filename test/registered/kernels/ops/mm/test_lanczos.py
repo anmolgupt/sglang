@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical and storage-lifetime checks for GPU RGB Lanczos preprocessing."""
+"""Numerical and storage-lifetime checks for GPU RGB Lanczos and bicubic preprocessing."""
 
 import unittest
 
@@ -7,16 +7,52 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.kernels.ops.mm.process.lanczos import lanczos_resize
+from sglang.kernels.ops.mm.process.lanczos import bicubic_resize, lanczos_resize
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-def pillow_reference(array, height, width, *, crop=None, mean=None, std=None):
+SHAPES = [
+    ((704, 1280), (480, 832)),
+    ((480, 832), (704, 1280)),
+    ((101, 73), (64, 96)),
+    ((17, 31), (37, 21)),
+    ((32, 32), (32, 32)),
+    ((7, 9), (1, 1)),
+    ((1, 1), (24, 40)),
+    ((1, 43), (9, 17)),
+    ((43, 1), (17, 9)),
+    ((21, 17), (16, 16)),
+    ((73, 101), (55, 88)),
+    ((100, 101), (93, 93)),
+]
+
+
+def make_pattern(rng, source, pattern):
+    array = rng.integers(0, 256, (*source, 3), dtype=np.uint8)
+    if pattern == "checkerboard":
+        checkerboard = ((np.indices(source).sum(axis=0) % 2) * 255).astype(np.uint8)
+        array = np.repeat(checkerboard[..., None], 3, axis=2)
+    elif pattern == "impulse":
+        array[:] = 0
+        array[source[0] // 2, source[1] // 2] = 255
+    return array
+
+
+def pillow_reference(
+    array,
+    height,
+    width,
+    *,
+    crop=None,
+    mean=None,
+    std=None,
+    resample=Image.Resampling.LANCZOS,
+):
     image = Image.fromarray(array)
-    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    image = image.resize((width, height), resample)
     if crop is not None:
         top, left, crop_h, crop_w = crop
         image = image.crop((left, top, left + crop_w, top + crop_h))
@@ -31,32 +67,10 @@ def pillow_reference(array, height, width, *, crop=None, mean=None, std=None):
 class TestLanczosPreprocess(CustomTestCase):
     def test_matches_pillow_geometry_and_rounding(self):
         rng = np.random.default_rng(9843)
-        shapes = [
-            ((704, 1280), (480, 832)),
-            ((480, 832), (704, 1280)),
-            ((101, 73), (64, 96)),
-            ((17, 31), (37, 21)),
-            ((32, 32), (32, 32)),
-            ((7, 9), (1, 1)),
-            ((1, 1), (24, 40)),
-            ((1, 43), (9, 17)),
-            ((43, 1), (17, 9)),
-            ((21, 17), (16, 16)),
-            ((73, 101), (55, 88)),
-            ((100, 101), (93, 93)),
-        ]
-        for source, target in shapes:
+        for source, target in SHAPES:
             for pattern in ("random", "checkerboard", "impulse"):
                 with self.subTest(source=source, target=target, pattern=pattern):
-                    array = rng.integers(0, 256, (*source, 3), dtype=np.uint8)
-                    if pattern == "checkerboard":
-                        checkerboard = (
-                            (np.indices(source).sum(axis=0) % 2) * 255
-                        ).astype(np.uint8)
-                        array = np.repeat(checkerboard[..., None], 3, axis=2)
-                    elif pattern == "impulse":
-                        array[:] = 0
-                        array[source[0] // 2, source[1] // 2] = 255
+                    array = make_pattern(rng, source, pattern)
                     output = lanczos_resize(torch.from_numpy(array).cuda(), *target)
                     expected = pillow_reference(array, *target)
                     self.assertTrue(torch.equal(output.cpu(), expected))
@@ -157,6 +171,45 @@ class TestLanczosPreprocess(CustomTestCase):
                         self.assertEqual(
                             output.dtype, torch.float32 if normalize else torch.uint8
                         )
+
+
+class TestBicubicPreprocess(CustomTestCase):
+    """Pillow's bicubic (a = -0.5, antialiased when shrinking), bit for bit;
+    PyTorch's CUDA bicubic differs from it by tens of levels."""
+
+    def test_matches_pillow_geometry_and_rounding(self):
+        rng = np.random.default_rng(5521)
+        for source, target in SHAPES:
+            for pattern in ("random", "checkerboard", "impulse"):
+                with self.subTest(source=source, target=target, pattern=pattern):
+                    array = make_pattern(rng, source, pattern)
+                    output = bicubic_resize(torch.from_numpy(array).cuda(), *target)
+                    expected = pillow_reference(
+                        array, *target, resample=Image.Resampling.BICUBIC
+                    )
+                    self.assertTrue(torch.equal(output.cpu(), expected))
+                    self.assertEqual(output.shape, (*target, 3))
+                    self.assertEqual(output.dtype, torch.uint8)
+
+    def test_fused_crop_and_normalize(self):
+        rng = np.random.default_rng(77)
+        array = rng.integers(0, 256, (61, 93, 3), dtype=np.uint8)
+        image = torch.from_numpy(array).cuda()
+        mean, std = (0.481, 0.458, 0.408), (0.269, 0.261, 0.276)
+        for crop in (None, (3, 5, 37, 71)):
+            with self.subTest(crop=crop):
+                output = bicubic_resize(image, 47, 101, crop=crop, mean=mean, std=std)
+                expected = pillow_reference(
+                    array,
+                    47,
+                    101,
+                    crop=crop,
+                    mean=mean,
+                    std=std,
+                    resample=Image.Resampling.BICUBIC,
+                )
+                self.assertTrue(torch.equal(output.cpu(), expected))
+                self.assertEqual(output.dtype, torch.float32)
 
 
 if __name__ == "__main__":
