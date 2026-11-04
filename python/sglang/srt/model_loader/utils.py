@@ -14,6 +14,9 @@ import transformers
 from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from sglang.srt.configs.embedding_model_spec import (
+    validate_configured_embedding_backend,
+)
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import get_device_sm
@@ -204,6 +207,13 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     # embedding wrapper instead of falling back to the generic HF backend.
     if getattr(model_config, "is_embedding_gemma", False):
         architectures = ["EmbeddingGemmaModel"]
+    # Keep the serialized HF backbone name unchanged. Only checkpoints with
+    # explicit Nemotron3 embedding metadata select the native pooled wrapper.
+    if (
+        getattr(model_config, "is_embedding_nemotron3", False)
+        and model_config.model_impl != ModelImpl.TRANSFORMERS
+    ):
+        architectures = ["EmbeddingNemotron3Model"]
     # Special handling for quantized Mixtral.
     # FIXME(woosuk): This is a temporary hack.
     mixtral_supported = [
@@ -230,6 +240,9 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
     model_cls, resolved_arch = ModelRegistry.resolve_model_cls(architectures)
+    validate_configured_embedding_backend(
+        getattr(model_config, "embedding_model_spec", None), model_cls
+    )
     setattr(model_config, "_resolved_model_arch", resolved_arch)
     setattr(
         model_config,
